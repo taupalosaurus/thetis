@@ -110,7 +110,7 @@ def test_gradient_from_adjoint(setup):
     J0 = assemble(solver_obj.fields.solution_2d[0]*dx)
 
     drag_func = solver_obj.options.quadratic_drag_coefficient
-    Jhat = ReducedFunctional(J0, drag_func)
+    Jhat = ReducedFunctional(J0, Control(drag_func))
 
     c = Function(drag_func)
     dc = Function(c)
