@@ -15,11 +15,12 @@
 # to enable a gradient-based optimisation using the adjoint to compute gradients,
 # we need to import from thetis_adjoint instead of thetis
 from thetis_adjoint import *
+from numpy.random import rand
 op2.init(log_level=INFO)
 
 parameters['coffee'] = {}  # temporarily disable COFFEE due to bug
 
-test_gradient = False  # whether to check the gradient computed by the adjoint
+test_gradient = True  # whether to check the gradient computed by the adjoint
 optimise = True
 
 # setup the Thetis solver obj as usual:
@@ -35,7 +36,7 @@ solver_obj = solver2d.FlowSolver2d(mesh2d, Constant(H))
 options = solver_obj.options
 options.timestep = timestep
 options.simulation_export_time = timestep
-options.simulation_end_time = tidal_period/2
+options.simulation_end_time = timestep/2. #tidal_period/2
 options.output_directory = 'outputs'
 options.check_volume_conservation_2d = True
 options.element_family = 'dg-dg'
@@ -56,11 +57,14 @@ right_tag = 2
 coasts_tag = 3
 tidal_elev = Function(FunctionSpace(mesh2d, "CG", 1), name='tidal_elev')
 tidal_elev_bc = {'elev': tidal_elev}
+# FIXME: adjoint of vectorial Constants
 noslip_bc = {'uv': Constant((0.0, 0.0))}
+freeslip_bc = {'un': Constant(0.0)}
 solver_obj.bnd_functions['shallow_water'] = {
     left_tag: tidal_elev_bc,
     right_tag: tidal_elev_bc,
-    coasts_tag: noslip_bc
+    #coasts_tag: noslip_bc
+    coasts_tag: freeslip_bc
 }
 
 
@@ -88,30 +92,61 @@ turbine_drag_term = TurbineDragTerm(u_test, u_space, eta_space,
                                     options=options)
 solver_obj.eq_sw.add_term(turbine_drag_term, 'implicit')
 
-turbine_friction.assign(0.0)
+turbine_friction.assign(0.1)
 solver_obj.assign_initial_conditions(uv=as_vector((1e-7, 0.0)))
 
 # Setup the functional. It computes a measure of the profit as the difference
 # of the power output of the farm (the "revenue") minus the cost based on the number
 # of turbines
 
-u, eta = split(solver_obj.fields.solution_2d)
-# should multiply this by density to get power in W - assuming rho=1000 we get kW instead
-power_integral = turbine_friction * (u[0]*u[0] + u[1]*u[1])**1.5 * dx(2)
+class TurbineDiagnostics(DiagnosticCallback):
+    name = 'turbine power'
+    variable_names = ['current_power', 'avg_power', 'cost', 'current_profit', 'avg_profit']
 
-# turbine friction=C_T*A_T/2.*turbine_density
-C_T = 0.8  # turbine thrust coefficient
-A_T = pi * (16./2)**2  # turbine cross section
-# cost integral is n/o turbines = \int turbine_density = \int c_t/(C_T A_T/2.)
-cost_integral = 1./(C_T*A_T/2.) * turbine_friction * dx(2)
+    def _initialize(self):
+        self.initial_val = None
+        self._initialized = True
+        #FIXME: should uv_2d, but split() doesn't work correctly in pyajdoint
+        uv = self.solver_obj.fields.solution_2d
 
-break_even_wattage = 100  # (kW) amount of power produced per turbine on average to "break even" (cost = revenue)
+        # should multiply this by density to get power in W - assuming rho=1000 we get kW instead
+        self.power_integral = turbine_friction * (uv[0]*uv[0] + uv[1]*uv[1])**1.5 * dx(2)
 
-# we rescale the functional such that the gradients are ~ order magnitude 1.
-# the scaling is chosen such that the gradient of break_even_wattage * cost_integral is of order 1
-# the power-integral is assumed to be of the same order of magnitude
-scaling = 1./assemble(break_even_wattage/(C_T*A_T/2.) * dx(2, domain=mesh2d))
-combined_functional = Functional(scaling * (power_integral - break_even_wattage * cost_integral) * dt)
+        # turbine friction=C_T*A_T/2.*turbine_density
+        C_T = 0.8  # turbine thrust coefficient
+        A_T = pi * (16./2)**2  # turbine cross section
+        # cost integral is n/o turbines = \int turbine_density = \int c_t/(C_T A_T/2.)
+        cost_integral = 1./(C_T*A_T/2.) * turbine_friction * dx(2)
+        self.cost = assemble(cost_integral)
+
+        self.break_even_wattage = 100  # (kW) amount of power produced per turbine on average to "break even" (cost = revenue)
+
+        # we rescale the functional such that the gradients are ~ order magnitude 1.
+        # the scaling is chosen such that the gradient of break_even_wattage * cost_integral is of order 1
+        # the power-integral is assumed to be of the same order of magnitude
+        self.scaling = 1./assemble(self.break_even_wattage/(C_T*A_T/2.) * dx(2, domain=mesh2d))
+
+        self.dt = self.solver_obj.dt
+        self.time_period = 0.
+        self.total_energy = 0.
+        self.functional_sum = 0.
+
+    def __call__(self):
+        if not hasattr(self, '_initialized') or self._initialized is False:
+            self._initialize()
+        self.time_period += float(self.dt)
+        current_power = assemble(self.power_integral)
+        self.total_energy += current_power * float(self.dt)
+        avg_power = self.total_energy / self.time_period
+        current_functional = self.scaling * (current_power - self.break_even_wattage * self.cost)
+        self.avg_functional = self.scaling * (avg_power - self.break_even_wattage * self.cost)
+        return (current_power, avg_power, self.cost, current_functional, self.avg_functional)
+
+    def message_str(self, *args):
+        line = 'Current: power: {}, cost: {}, functional: {}:\n'.format(args[0], args[2], args[3])
+        line += 'Average: power: {}, cost: {}, functional: {}:'.format(args[1], args[2], args[4])
+        return line
+
 
 
 # a function to update the tidal_elev bc value every timestep
@@ -123,25 +158,24 @@ omega = 2 * pi / tidal_period
 
 def update_forcings(t, annotate=True):
     print_output("Updating tidal elevation at t = {}".format(t))
-    P = assemble(power_integral)
-    N = assemble(cost_integral)
-    print_output("Power, N turbines, profit = {}, {}, {}".format(P, N, P-break_even_wattage*N))
     # NOTE: we need to explicitly tell dolfin-adjoint to annotate this as by default it seems to
     # only annotate if the interpoland is a Function (is this reasonable?)
-    tidal_elev.interpolate(tidal_amplitude*sin(omega*t + omega/pow(g*H, 0.5)*x[0]), annotate=annotate)
+    tidal_elev.interpolate(tidal_amplitude*sin(omega*t + omega/pow(g*H, 0.5)*x[0])) #, annotate=annotate)
+    return
     # NOTE: it seems firedrake-adjoint (dolfin-adjoint in general?) cannot handle functions that are part of a
     # time-integrated Functional which do not change over time and are therefore not annotated
     turbine_friction.project(turbine_friction, annotate=annotate)
 
 
+callback = TurbineDiagnostics(solver_obj)
+solver_obj.add_callback(callback)
+
 # run as normal (this run will be annotated by firedrake-adjoint)
 solver_obj.iterate(update_forcings=update_forcings)
 
 
-# everything relevant should be annotated now
-parameters["adjoint"]["stop_annotating"] = True
-# write out the annotation for debugging purposes
-adj_html('forward.html', 'forward')
+pause_annotation()
+get_working_tape().visualise('graph.dot', dot=True)
 
 tfpvd = File('turbine_friction.pvd')
 
@@ -154,7 +188,7 @@ class MyReducedFunctional(ReducedFunctional):
     def derivative(self, **kwargs):
         dj = super(MyReducedFunctional, self).derivative(**kwargs)
         # need to make sure dj always has the same name in the output
-        grad = dj[0].copy()
+        grad = dj.copy()
         grad.rename("Gradient")
         # same thing for the control
         tf = self.controls[0].data().copy()
@@ -167,13 +201,13 @@ class MyReducedFunctional(ReducedFunctional):
 # rf(tf) = J(u(tf), tf) where the velocities u(tf) of the entire simulation
 # are computed by replaying the forward model for any provided turbine friction tf
 c = Control(turbine_friction)
-rf = MyReducedFunctional(combined_functional, c)
+rf = MyReducedFunctional(callback.avg_functional, c)
 
 if test_gradient:
-    dJdc = compute_gradient(combined_functional, c, forget=False)
+    dJdc = compute_gradient(callback.avg_functional, c)
     File('dJdc.pvd').write(dJdc)
-    J0 = rf(turbine_friction)
-    minconv = taylor_test(rf, c, J0, dJdc, seed=1e-4)
+    dJdc.vector()[:] = rand(dJdc.function_space().dim())
+    minconv = taylor_test(rf, turbine_friction, dJdc)
     print_output("Order of convergence with taylor test (should be 2) = {}".format(minconv))
 
     assert minconv > 1.95
