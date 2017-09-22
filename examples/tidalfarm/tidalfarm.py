@@ -20,7 +20,7 @@ op2.init(log_level=INFO)
 
 parameters['coffee'] = {}  # temporarily disable COFFEE due to bug
 
-test_gradient = True  # whether to check the gradient computed by the adjoint
+test_gradient = False  # whether to check the gradient computed by the adjoint
 optimise = True
 
 # setup the Thetis solver obj as usual:
@@ -36,7 +36,7 @@ solver_obj = solver2d.FlowSolver2d(mesh2d, Constant(H))
 options = solver_obj.options
 options.timestep = timestep
 options.simulation_export_time = timestep
-options.simulation_end_time = timestep/2. #tidal_period/2
+options.simulation_end_time = tidal_period/2
 options.output_directory = 'outputs'
 options.check_volume_conservation_2d = True
 options.element_family = 'dg-dg'
@@ -57,7 +57,7 @@ right_tag = 2
 coasts_tag = 3
 tidal_elev = Function(FunctionSpace(mesh2d, "CG", 1), name='tidal_elev')
 tidal_elev_bc = {'elev': tidal_elev}
-# FIXME: adjoint of vectorial Constants
+# FIXME: adjoint of vectorial Constants is broken
 noslip_bc = {'uv': Constant((0.0, 0.0))}
 freeslip_bc = {'un': Constant(0.0)}
 solver_obj.bnd_functions['shallow_water'] = {
@@ -92,12 +92,19 @@ turbine_drag_term = TurbineDragTerm(u_test, u_space, eta_space,
                                     options=options)
 solver_obj.eq_sw.add_term(turbine_drag_term, 'implicit')
 
-turbine_friction.assign(0.1)
+turbine_friction.assign(0.0)
 solver_obj.assign_initial_conditions(uv=as_vector((1e-7, 0.0)))
 
 # Setup the functional. It computes a measure of the profit as the difference
 # of the power output of the farm (the "revenue") minus the cost based on the number
 # of turbines
+
+
+# turbine characteristics:
+C_T = 0.8  # turbine thrust coefficient
+D_T = 16.  # turbine diameter
+A_T = pi * (D_T/2)**2  # turbine cross section
+
 
 class TurbineDiagnostics(DiagnosticCallback):
     name = 'turbine power'
@@ -113,8 +120,6 @@ class TurbineDiagnostics(DiagnosticCallback):
         self.power_integral = turbine_friction * (uv[0]*uv[0] + uv[1]*uv[1])**1.5 * dx(2)
 
         # turbine friction=C_T*A_T/2.*turbine_density
-        C_T = 0.8  # turbine thrust coefficient
-        A_T = pi * (16./2)**2  # turbine cross section
         # cost integral is n/o turbines = \int turbine_density = \int c_t/(C_T A_T/2.)
         cost_integral = 1./(C_T*A_T/2.) * turbine_friction * dx(2)
         self.cost = assemble(cost_integral)
@@ -148,7 +153,6 @@ class TurbineDiagnostics(DiagnosticCallback):
         return line
 
 
-
 # a function to update the tidal_elev bc value every timestep
 # we also use it to display the profit each time step (which will be a time-integrated into the functional)
 x = SpatialCoordinate(mesh2d)
@@ -156,15 +160,9 @@ g = 9.81
 omega = 2 * pi / tidal_period
 
 
-def update_forcings(t, annotate=True):
+def update_forcings(t):
     print_output("Updating tidal elevation at t = {}".format(t))
-    # NOTE: we need to explicitly tell dolfin-adjoint to annotate this as by default it seems to
-    # only annotate if the interpoland is a Function (is this reasonable?)
-    tidal_elev.interpolate(tidal_amplitude*sin(omega*t + omega/pow(g*H, 0.5)*x[0])) #, annotate=annotate)
-    return
-    # NOTE: it seems firedrake-adjoint (dolfin-adjoint in general?) cannot handle functions that are part of a
-    # time-integrated Functional which do not change over time and are therefore not annotated
-    turbine_friction.project(turbine_friction, annotate=annotate)
+    tidal_elev.interpolate(tidal_amplitude*sin(omega*t + omega/pow(g*H, 0.5)*x[0]))
 
 
 callback = TurbineDiagnostics(solver_obj)
@@ -175,7 +173,6 @@ solver_obj.iterate(update_forcings=update_forcings)
 
 
 pause_annotation()
-get_working_tape().visualise('graph.dot', dot=True)
 
 tfpvd = File('turbine_friction.pvd')
 
@@ -204,19 +201,24 @@ c = Control(turbine_friction)
 rf = MyReducedFunctional(callback.avg_functional, c)
 
 if test_gradient:
+    # write out the taped annotation graph, which can be viewed with e.g. xdot
+    get_working_tape().visualise('graph.dot', dot=True)
+    # visualise initial gradient:
     dJdc = compute_gradient(callback.avg_functional, c)
     File('dJdc.pvd').write(dJdc)
+    # setup a random direction in the function space along which to do the taylor test
     dJdc.vector()[:] = rand(dJdc.function_space().dim())
     minconv = taylor_test(rf, turbine_friction, dJdc)
+    # if the gradient is computed correctly, we should get 2nd order convergence of the Taylor remainder
     print_output("Order of convergence with taylor test (should be 2) = {}".format(minconv))
 
     assert minconv > 1.95
 
 if optimise:
-    # compute maximum turbine density
-    max_density = 1./(16.*2.5*16.*5)
+    # compute maximum turbine density, keeping 2.5 x 5 diameters distance
+    max_density = 1./(D_T * 2.5 * D_T * 5)
     max_tf = C_T * A_T/2. * max_density
-    print_output("Maximum turbine density =".format(max_tf))
+    print_output("Maximum turbine density = {}".format(max_tf))
 
     tf_opt = maximise(rf, bounds=[0, max_tf],
                       options={'maxiter': 100})
