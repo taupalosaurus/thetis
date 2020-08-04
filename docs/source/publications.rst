@@ -11,6 +11,8 @@ Also see `instructions for citing Firedrake <https://firedrakeproject.org/citing
 2020
 ----
 
+Wallwork, J. G., Barral, N., Kramer, S. C., Ham, D. A., & Piggott, M. D.: Goal-oriented error estimation and mesh adaptation for shallow water modelling. *SN Applied Science* 2, 1053, doi:`10.1007/s42452-020-2745-9 <https://doi.org/10.1007/s42452-020-2745-9>`_, 2020.
+
 Pan, W., Kramer, S. C., Kärnä, T., and Piggott, M. D.: Comparing non-hydrostatic extensions to a discontinuous finite element coastal ocean model. *Ocean Modelling*, 151: 101634, doi:`10.1016/j.ocemod.2020.101634 <https://doi.org/10.1016/j.ocemod.2020.101634>`_, 2020.
 
 Kärnä, T.: Discontinuous Galerkin discretization for two-equation turbulence closure model, *Ocean Modelling*, 150:101619, doi:`10.1016/j.ocemod.2020.101619 <https://doi.org/10.1016/j.ocemod.2020.101619>`_, 2020.
